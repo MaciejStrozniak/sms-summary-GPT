@@ -2,118 +2,94 @@
 
 // Importowanie niezbędnych modułów
 const { google } = require('googleapis');
-const { authenticate } = require('@google-cloud/local-auth');
-const path = require('path');
-const fs = require('fs').promises; // Używamy fs.promises dla operacji asynchronicznych
+// const { authenticate } = require('@google-cloud/local-auth'); // To nie będzie potrzebne w Cloud Run
+const path = require('path'); // Nadal przydatne, choć mniej
+const fs = require('fs').promises; // Będzie używane do odczytu credentials.json LOKALNIE (jednorazowo), ale nie w Cloud Run
 require('dotenv').config(); // Ładuje zmienne środowiskowe z pliku .env
+const { Storage } = require('@google-cloud/storage'); // Nowy import dla Google Cloud Storage
+const express = require('express'); // Nowy import dla serwera HTTP (Cloud Run)
 
-// Definicja ścieżek do plików konfiguracyjnych i tokena
-const CREDENTIALS_PATH = path.join(process.cwd(), 'credentials.json'); // Plik pobrany z Google Cloud Console
-const TOKEN_PATH = path.join(process.cwd(), 'token.json'); // Plik, w którym będzie zapisywany token odświeżania
-const SUMMARY_FILE_PATH = path.join(process.cwd(), 'daily_summaries.json'); // Ścieżka do pliku JSON z podsumowaniami
+const app = express();
+app.use(express.json()); // Do parsowania JSON z requestów HTTP
 
-// --- Funkcje autoryzacji Google API ---
+// Definicja stałych (ścieżki do plików, które będą używane tylko LOKALNIE do uzyskania refresh_token)
+// W Cloud Run te pliki nie będą istnieć, a ich wartości będą zmiennymi środowiskowymi.
+const CREDENTIALS_PATH = path.join(process.cwd(), 'credentials.json');
+const TOKEN_PATH = path.join(process.cwd(), 'token.json'); // Plik, w którym będzie zapisywany refresh_token LOKALNIE
+const SUMMARY_FILE_NAME = 'daily_summaries.json'; // Nazwa pliku JSON z podsumowaniami w Cloud Storage
+
+// --- Zmienne środowiskowe dla Cloud Run ---
+// Będą one ustawione w konfiguracji serwisu Cloud Run
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
+const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'urn:ietf:wg:oauth:2.0:oob'; // Domyślne dla aplikacji desktopowych
+const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
+const GCS_BUCKET_NAME = process.env.GCS_BUCKET_NAME; // Nazwa zasobnika Cloud Storage
+
+// Inicjalizacja Google Cloud Storage
+const storage = new Storage();
+
+// --- Funkcje autoryzacji Google API (dostosowane do Cloud Run) ---
 
 /**
- * Ładuje zapisane dane uwierzytelniające (token) z pliku 'token.json', jeśli istnieje.
- * Jeśli token istnieje i jest ważny, używa go do autoryzacji.
- * @returns {Promise<Object|null>} Obiekt autoryzacji Google (OAuth2Client) lub null, jeśli token nie istnieje.
+ * Tworzy i zwraca obiekt OAuth2Client na podstawie zmiennych środowiskowych.
+ * W środowisku Cloud Run nie będziemy używać plików localnych.
+ * @returns {Object} Autoryzowany klient OAuth2.
  */
-async function loadSavedCredentialsIfExist() {
-  try {
-    // Najpierw ładujemy podstawowe dane klienta OAuth z credentials.json
-    const contentKeys = await fs.readFile(CREDENTIALS_PATH);
-    const keys = JSON.parse(contentKeys);
-    const key = keys.installed || keys.web;
-
-    const oAuth2Client = new google.auth.OAuth2(
-      key.client_id,
-      key.client_secret,
-      key.redirect_uris[0] // Używamy pierwszego URI przekierowania
-    );
-
-    // Następnie próbujemy załadować zapisany token z token.json
-    const tokenContent = await fs.readFile(TOKEN_PATH);
-    const credentials = JSON.parse(tokenContent);
-
-    // Sprawdzamy, czy token odświeżania jest obecny
-    if (!credentials.refresh_token) {
-      console.warn('W token.json brak tokena odświeżania. Konieczna ponowna autoryzacja.');
-      return null;
-    }
-
-    // Ustawiamy załadowane dane uwierzytelniające na kliencie OAuth2
-    oAuth2Client.setCredentials(credentials);
-
-    // Próba odświeżenia tokena dostępu, aby upewnić się, że jest aktualny.
-    // getAccessToken() automatycznie użyje refresh_token do odświeżenia, jeśli access_token wygasł.
-    try {
-      const { token } = await oAuth2Client.getAccessToken(); // Wymuś odświeżenie tokena dostępu
-      oAuth2Client.credentials.access_token = token; // Upewnij się, że klient ma najnowszy access token
-      console.log('Pomyślnie załadowano i odświeżono token dostępu.');
-      return oAuth2Client;
-    } catch (refreshErr) {
-      console.warn('Nie udało się odświeżyć tokena dostępu z zapisanego tokena odświeżania. Konieczna ponowna autoryzacja.', refreshErr.message);
-      // Usuń nieprawidłowy token, aby wymusić nową autoryzację
-      await fs.unlink(TOKEN_PATH).catch(() => {}); // Usuń plik, zignoruj błędy, jeśli już nie istnieje
-      return null;
-    }
-
-  } catch (err) {
-    // Jeśli plik nie istnieje lub jest błąd w parsowaniu/odczycie, zwracamy null
-    console.warn('Błąd podczas ładowania lub parsowania token.json / credentials.json. Konieczna ponowna autoryzacja.', err.message);
-    return null;
+function getOAuth2ClientFromEnv() {
+  if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REDIRECT_URI) {
+    throw new Error('BŁĄD: Brak niezbędnych zmiennych środowiskowych Google Client ID, Client Secret lub Redirect URI.');
   }
+  const oAuth2Client = new google.auth.OAuth2(
+    GOOGLE_CLIENT_ID,
+    GOOGLE_CLIENT_SECRET,
+    GOOGLE_REDIRECT_URI
+  );
+
+  // Jeśli dostępny jest refresh_token ze zmiennych środowiskowych, użyj go.
+  // Jest to kluczowe dla automatycznej autoryzacji w Cloud Run.
+  if (GOOGLE_REFRESH_TOKEN) {
+    oAuth2Client.setCredentials({
+      refresh_token: GOOGLE_REFRESH_TOKEN,
+    });
+    // Wymuszenie odświeżenia tokena dostępu, aby upewnić się, że jest aktualny.
+    // getAccessToken() automatycznie użyje refresh_token do odświeżenia, jeśli access_token wygasł.
+    oAuth2Client.getAccessToken().then(res => {
+      oAuth2Client.credentials.access_token = res.token;
+      console.log('Token dostępu odświeżony pomyślnie z refresh_token.');
+    }).catch(err => {
+      console.error('Błąd podczas odświeżania tokena dostępu z refresh_token:', err.message);
+      // W środowisku produkcyjnym warto zaimplementować alert, jeśli refresh_token jest nieprawidłowy
+    });
+  } else {
+    // W środowisku lokalnym to jest ok, bo autoryzacja dzieje się interaktywnie.
+    // W Cloud Run ten przypadek powinien być błędem, chyba że aplikacja jest uruchamiana w trybie interaktywnym (co nie jest celem).
+    console.warn('OSTRZEŻENIE: Brak GOOGLE_REFRESH_TOKEN w zmiennych środowiskowych. Aplikacja nie będzie mogła automatycznie autoryzować Google API w Cloud Run.');
+  }
+
+  return oAuth2Client;
 }
 
-/**
- * Zapisuje nowo uzyskany token autoryzacji (w tym refresh token) do pliku 'token.json'.
- * Dzięki temu aplikacja nie będzie musiała prosić o autoryzację w przeglądarce przy każdym uruchomieniu.
- * @param {Object} client - Autoryzowany klient OAuth2 (zawierający świeży token).
- */
-async function saveCredentials(client) {
-  // Zapisujemy całe dane uwierzytelniające klienta (w tym access_token i refresh_token)
-  // do pliku token.json. Reszta danych klienta (client_id, client_secret)
-  // jest ładowana z credentials.json.
-  await fs.writeFile(TOKEN_PATH, JSON.stringify(client.credentials));
-}
 
 /**
- * Główna funkcja autoryzacji.
- * Sprawdza, czy istnieje zapisany token. Jeśli tak, używa go.
- * Jeśli nie, inicjuje proces autoryzacji OAuth2 poprzez przeglądarkę użytkownika
- * i zapisuje nowy token do pliku.
+ * Funkcja autoryzacji dla Cloud Run. Zawsze używa zmiennych środowiskowych.
+ * W środowisku lokalnym, nadal możesz użyć poprzedniej logiki z plikami token.json
+ * do JEDNORAZOWEGO uzyskania refresh_token.
  * @returns {Promise<Object>} Autoryzowany klient OAuth2.
  */
 async function authorize() {
-  let client = await loadSavedCredentialsIfExist(); // Próba załadowania istniejącego tokena
-  if (client) {
-    console.log('Używam istniejącego tokena do autoryzacji.');
-    return client;
-  }
-
-  console.log('Brak istniejącego tokena, rozpoczynam proces autoryzacji...');
-
-  // Definiujemy zakresy dostępu (uprawnienia), których potrzebuje nasza aplikacja.
-  // Muszą być zgodne z tymi, które zostały skonfigurowane w Google Cloud Console.
-  const SCOPES = [
-    'https://www.googleapis.com/auth/spreadsheets.readonly', // Tylko odczyt z Arkuszy Google
-    'https://www.googleapis.com/auth/gmail.send',           // Tylko wysyłanie e-maili przez Gmail
-  ];
-
-  // Używamy @google-cloud/local-auth do przeprowadzenia procesu autoryzacji w przeglądarce.
-  client = await authenticate({
-    scopes: SCOPES,       // Zakresy uprawnień
-    keyfilePath: CREDENTIALS_PATH, // Ścieżka do pliku credentials.json
-  });
-
-  // Jeśli autoryzacja przebiegła pomyślnie i uzyskaliśmy nowy token, zapisujemy go.
-  if (client.credentials) {
-    await saveCredentials(client);
-    console.log('Nowy token został zapisany w token.json');
-  }
-  return client;
+    // Dla Cloud Run, zawsze próbujemy autoryzacji ze zmiennych środowiskowych.
+    try {
+        const client = getOAuth2ClientFromEnv();
+        // W przypadku Cloud Run, sama inicjalizacja z refresh_token jest traktowana jako autoryzacja.
+        // Ewentualne błędy odświeżania tokena będą logowane w getOAuth2ClientFromEnv.
+        return client;
+    } catch (err) {
+        console.error('Krytyczny błąd podczas inicjalizacji autoryzacji dla Cloud Run:', err.message);
+        throw err;
+    }
 }
+
 
 // --- Narzędzia do obsługi Google Sheets (Arkuszy Google) ---
 
