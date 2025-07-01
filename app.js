@@ -3,8 +3,8 @@
 // Importowanie niezbędnych modułów
 const { google } = require('googleapis');
 // const { authenticate } = require('@google-cloud/local-auth'); // To nie będzie potrzebne w Cloud Run
-const path = require('path'); // Nadal przydatne, choć mniej
-const fs = require('fs').promises; // Będzie używane do odczytu credentials.json LOKALNIE (jednorazowo), ale nie w Cloud Run
+const path = require('path'); 
+const fs = require('fs').promises; // Będzie używane tylko do jednorazowego lokalnego odczytu credentials.json dla refresh_token
 require('dotenv').config(); // Ładuje zmienne środowiskowe z pliku .env
 const { Storage } = require('@google-cloud/storage'); // Nowy import dla Google Cloud Storage
 const express = require('express'); // Nowy import dla serwera HTTP (Cloud Run)
@@ -12,59 +12,74 @@ const express = require('express'); // Nowy import dla serwera HTTP (Cloud Run)
 const app = express();
 app.use(express.json()); // Do parsowania JSON z requestów HTTP
 
-// Definicja stałych (ścieżki do plików, które będą używane tylko LOKALNIE do uzyskania refresh_token)
-// W Cloud Run te pliki nie będą istnieć, a ich wartości będą zmiennymi środowiskowymi.
+// --- Definicja stałych (ścieżki do plików LOKALNYCH) ---
+// Te ścieżki są istotne TYLKO dla lokalnego wygenerowania refresh_token.
+// W Cloud Run te pliki nie będą używane.
 const CREDENTIALS_PATH = path.join(process.cwd(), 'credentials.json');
-const TOKEN_PATH = path.join(process.cwd(), 'token.json'); // Plik, w którym będzie zapisywany refresh_token LOKALNIE
-const SUMMARY_FILE_NAME = 'daily_summaries.json'; // Nazwa pliku JSON z podsumowaniami w Cloud Storage
+const TOKEN_PATH = path.join(process.cwd(), 'token.json'); // Plik, w którym lokalnie zapisujemy refresh_token
+
+// --- Definicja stałych dla Cloud Storage ---
+// Nazwa pliku w zasobniku GCS
+const SUMMARY_FILE_NAME = 'daily_summaries.json'; 
 
 // --- Zmienne środowiskowe dla Cloud Run ---
-// Będą one ustawione w konfiguracji serwisu Cloud Run
+// Te zmienne MUSZĄ BYĆ ustawione w konfiguracji serwisu Cloud Run.
+// Będą one używane zamiast lokalnych plików credentials.json i token.json.
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
-const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'urn:ietf:wg:oauth:2.0:oob'; // Domyślne dla aplikacji desktopowych
-const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN;
-const GCS_BUCKET_NAME = process.env.GCS_BUCKET_NAME; // Nazwa zasobnika Cloud Storage
+// URI przekierowania musi być taki sam jak skonfigurowany w Google Cloud Console dla "aplikacji komputerowej"
+const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || 'urn:ietf:wg:oauth:2.0:oob'; 
+const GOOGLE_REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN; // Kluczowy token do stałej autoryzacji w chmurze
 
-// Inicjalizacja Google Cloud Storage
+// --- Inicjalizacja Google Cloud Storage ---
 const storage = new Storage();
+// Upewnij się, że GCS_BUCKET_NAME jest ustawione w zmiennych środowiskowych Cloud Run
+// Ta linia zostanie wykonana tylko jeśli process.env.GCS_BUCKET_NAME jest zdefiniowane
+// W przeciwnym razie, błąd zostanie wychwycony w runDailyTasks
+let bucket; 
+if (process.env.GCS_BUCKET_NAME) {
+  bucket = storage.bucket(process.env.GCS_BUCKET_NAME);
+}
+
 
 // --- Funkcje autoryzacji Google API (dostosowane do Cloud Run) ---
 
 /**
  * Tworzy i zwraca obiekt OAuth2Client na podstawie zmiennych środowiskowych.
- * W środowisku Cloud Run nie będziemy używać plików localnych.
+ * Ta funkcja jest kluczowa dla działania aplikacji w Cloud Run, gdzie nie ma dostępu do plików lokalnych
+ * credentials.json i token.json.
  * @returns {Object} Autoryzowany klient OAuth2.
  */
 function getOAuth2ClientFromEnv() {
   if (!GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REDIRECT_URI) {
-    throw new Error('BŁĄD: Brak niezbędnych zmiennych środowiskowych Google Client ID, Client Secret lub Redirect URI.');
+    throw new Error('BŁĄD: Brak niezbędnych zmiennych środowiskowych (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI) do konfiguracji OAuth2Client.');
   }
+
   const oAuth2Client = new google.auth.OAuth2(
     GOOGLE_CLIENT_ID,
     GOOGLE_CLIENT_SECRET,
     GOOGLE_REDIRECT_URI
   );
 
-  // Jeśli dostępny jest refresh_token ze zmiennych środowiskowych, użyj go.
-  // Jest to kluczowe dla automatycznej autoryzacji w Cloud Run.
+  // Sprawdzamy, czy jest dostępny GOOGLE_REFRESH_TOKEN.
+  // Jest to absolutnie niezbędne do automatycznej, bezobsługowej autoryzacji w Cloud Run.
   if (GOOGLE_REFRESH_TOKEN) {
     oAuth2Client.setCredentials({
       refresh_token: GOOGLE_REFRESH_TOKEN,
     });
-    // Wymuszenie odświeżenia tokena dostępu, aby upewnić się, że jest aktualny.
+    // Próba odświeżenia tokena dostępu, aby upewnić się, że jest aktualny.
     // getAccessToken() automatycznie użyje refresh_token do odświeżenia, jeśli access_token wygasł.
     oAuth2Client.getAccessToken().then(res => {
+      // res.token zawiera nowy access_token. Ustawiamy go na kliencie.
       oAuth2Client.credentials.access_token = res.token;
       console.log('Token dostępu odświeżony pomyślnie z refresh_token.');
     }).catch(err => {
-      console.error('Błąd podczas odświeżania tokena dostępu z refresh_token:', err.message);
-      // W środowisku produkcyjnym warto zaimplementować alert, jeśli refresh_token jest nieprawidłowy
+      console.error('Błąd podczas odświeżania tokena dostępu z refresh_token w Cloud Run. Upewnij się, że token jest nadal ważny i ma odpowiednie zakresy. Konieczna ręczna regeneracja refresh_token, jeśli problem się powtarza:', err.message);
+      // W środowisku produkcyjnym można rozważyć wysłanie alertu do administratora
     });
   } else {
-    // W środowisku lokalnym to jest ok, bo autoryzacja dzieje się interaktywnie.
-    // W Cloud Run ten przypadek powinien być błędem, chyba że aplikacja jest uruchamiana w trybie interaktywnym (co nie jest celem).
-    console.warn('OSTRZEŻENIE: Brak GOOGLE_REFRESH_TOKEN w zmiennych środowiskowych. Aplikacja nie będzie mogła automatycznie autoryzować Google API w Cloud Run.');
+    // Ten przypadek wskazuje na błąd konfiguracji w Cloud Run.
+    throw new Error('BŁĄD: GOOGLE_REFRESH_TOKEN nie został ustawiony w zmiennych środowiskowych Cloud Run. Automatyczna autoryzacja Google API jest niemożliwa.');
   }
 
   return oAuth2Client;
@@ -72,17 +87,18 @@ function getOAuth2ClientFromEnv() {
 
 
 /**
- * Funkcja autoryzacji dla Cloud Run. Zawsze używa zmiennych środowiskowych.
- * W środowisku lokalnym, nadal możesz użyć poprzedniej logiki z plikami token.json
- * do JEDNORAZOWEGO uzyskania refresh_token.
+ * Funkcja autoryzacji dla środowiska Cloud Run.
+ * Zawsze próbuje autoryzować się za pomocą zmiennych środowiskowych.
+ * W środowisku lokalnym, nadal będziesz używać poprzedniej logiki z plikami token.json
+ * do JEDNORAZOWEGO uzyskania refresh_token, który następnie umieścisz w zmiennych środowiskowych Cloud Run.
  * @returns {Promise<Object>} Autoryzowany klient OAuth2.
  */
 async function authorize() {
-    // Dla Cloud Run, zawsze próbujemy autoryzacji ze zmiennych środowiskowych.
+    // W Cloud Run zawsze używamy konfiguracji ze zmiennych środowiskowych
+    // i nie ma interaktywnej autoryzacji przez przeglądarkę.
     try {
         const client = getOAuth2ClientFromEnv();
-        // W przypadku Cloud Run, sama inicjalizacja z refresh_token jest traktowana jako autoryzacja.
-        // Ewentualne błędy odświeżania tokena będą logowane w getOAuth2ClientFromEnv.
+        console.log('Autoryzacja Google API dla Cloud Run zainicjowana ze zmiennych środowiskowych.');
         return client;
     } catch (err) {
         console.error('Krytyczny błąd podczas inicjalizacji autoryzacji dla Cloud Run:', err.message);
@@ -92,6 +108,7 @@ async function authorize() {
 
 
 // --- Narzędzia do obsługi Google Sheets (Arkuszy Google) ---
+// (BEZ ZMIAN W STOSUNUNKU DO POPRZEDNIEJ WERSJI)
 
 /**
  * Pobiera dane z określonego zakresu w Arkuszu Google.
@@ -235,6 +252,7 @@ function mapTasksToPeople(dailyData) {
 }
 
 // --- Narzędzia do anonimizacji i de-anonimizacji danych personalnych ---
+// (BEZ ZMIAN W STOSUNKU DO POPRZEDNIEJ WERSJI)
 
 /**
  * Anonimizuje dane personalne w tekście i w kluczach obiektu zadań.
@@ -334,6 +352,7 @@ function deanonymizeSummary(anonymizedText, personalDataMap) {
 }
 
 // --- Narzędzia do komunikacji z LLM (OpenAI GPT API) ---
+// (BEZ ZMIAN W STOSUNKU DO POPRZEDNIEJ WERSJI)
 
 /**
  * Generuje podsumowanie na podstawie anonimowych danych za pomocą OpenAI GPT API.
@@ -409,48 +428,69 @@ async function generateSummaryWithLLM(anonymizedData) {
   }
 }
 
-// --- Narzędzia do zapisu lokalnego (JSON) ---
+// --- Narzędzia do zapisu podsumowania (dostosowane do Google Cloud Storage) ---
 
 /**
- * Zapisuje lub aktualizuje plik JSON z codziennymi podsumowaniami.
- * Jeśli plik istnieje, dodaje nowy wpis. Jeśli nie, tworzy nowy plik.
- * Każde podsumowanie jest obiektem zawierającym datę, dzień tygodnia i treść podsumowania.
- * @param {Object} summaryData - Obiekt z danymi do zapisania (np. { date, dayOfWeek, summary: finalSummary }).
- * @param {string} filePath - Ścieżka do pliku JSON.
+ * Pobiera istniejące podsumowania z Google Cloud Storage.
+ * @param {string} bucketName - Nazwa zasobnika GCS.
+ * @param {string} fileName - Nazwa pliku JSON w zasobniku.
+ * @returns {Promise<Array<Object>>} Tablica istniejących podsumowań lub pusta tablica.
  */
-async function saveSummaryToJsonFile(summaryData, filePath) {
-  let existingSummaries = [];
+async function loadSummariesFromGCS(bucketName, fileName) {
+  const file = storage.bucket(bucketName).file(fileName);
   try {
-    const fileContent = await fs.readFile(filePath, 'utf8');
-    existingSummaries = JSON.parse(fileContent);
-    if (!Array.isArray(existingSummaries)) {
-      console.warn('Plik JSON nie zawiera tablicy. Zostanie utworzona nowa tablica.');
-      existingSummaries = [];
+    const [exists] = await file.exists();
+    if (exists) {
+      const [content] = await file.download();
+      const parsedContent = JSON.parse(content.toString('utf8'));
+      if (Array.isArray(parsedContent)) {
+        console.log(`Pomyślnie załadowano istniejące podsumowania z GCS: gs://${bucketName}/${fileName}`);
+        return parsedContent;
+      } else {
+        console.warn(`Plik GCS ${fileName} nie zawiera tablicy. Zostanie utworzona nowa tablica.`);
+        return [];
+      }
+    } else {
+      console.log(`Plik GCS ${fileName} nie istnieje. Tworzę nową tablicę podsumowań.`);
+      return [];
     }
   } catch (err) {
-    if (err.code === 'ENOENT') {
-      console.log(`Plik ${filePath} nie istnieje. Tworzę nowy plik.`);
-    } else {
-      console.error(`Błąd podczas odczytu lub parsowania pliku ${filePath}:`, err.message);
-      // Nadal kontynuujemy z pustą tablicą, aby uniknąć zatrzymania aplikacji
-      existingSummaries = [];
-    }
+    console.error(`Błąd podczas odczytu lub parsowania pliku z GCS: gs://${bucketName}/${fileName}. Błąd: ${err.message}`);
+    // Nadal kontynuujemy z pustą tablicą, aby uniknąć zatrzymania aplikacji
+    return [];
+  }
+}
+
+/**
+ * Zapisuje (aktualizuje) plik JSON z codziennymi podsumowaniami w Google Cloud Storage.
+ * Nowe podsumowanie jest dodawane do istniejącej tablicy.
+ * @param {Object} summaryData - Obiekt z danymi do zapisania (np. { date, dayOfWeek, summary: finalSummary }).
+ */
+async function saveSummaryToGCS(summaryData) {
+  if (!process.env.GCS_BUCKET_NAME) { // Używamy process.env.GCS_BUCKET_NAME
+    throw new Error('BŁĄD: Nazwa zasobnika Cloud Storage (GCS_BUCKET_NAME) nie została ustawiona w zmiennych środowiskowych!');
   }
 
-  // Dodaj nowe podsumowanie do tablicy
+  // Używamy zmiennej 'bucket' zainicjalizowanej globalnie
+  const file = bucket.file(SUMMARY_FILE_NAME); 
+
+  const existingSummaries = await loadSummariesFromGCS(process.env.GCS_BUCKET_NAME, SUMMARY_FILE_NAME);
   existingSummaries.push(summaryData);
 
-  // Zapisz zaktualizowaną tablicę z powrotem do pliku
   try {
-    await fs.writeFile(filePath, JSON.stringify(existingSummaries, null, 2), 'utf8');
-    console.log(`Podsumowanie pomyślnie zapisane do pliku: ${filePath}`);
+    await file.save(JSON.stringify(existingSummaries, null, 2), {
+      contentType: 'application/json'
+    });
+    console.log(`Podsumowanie pomyślnie zapisane/aktualizowane w GCS: gs://${process.env.GCS_BUCKET_NAME}/${SUMMARY_FILE_NAME}`);
   } catch (err) {
-    console.error(`Błąd podczas zapisu do pliku ${filePath}:`, err.message);
+    console.error(`Błąd podczas zapisu podsumowania do GCS: ${err.message}`);
     throw err;
   }
 }
 
+
 // --- Narzędzia do wysyłki e-maili (Gmail) ---
+// (BEZ ZMIAN W STOSUNKU DO POPRZEDNIEJ WERSJI)
 
 /**
  * Wysyła wiadomość e-mail za pośrednictwem Gmail API.
@@ -493,54 +533,47 @@ async function sendEmail(auth, recipientEmail, subject, body) {
   }
 }
 
-// --- Główna funkcja aplikacji (punkt startowy) ---
 
-async function main() {
+// --- Główna logika biznesowa aplikacji ---
+// Funkcja `runDailyTasks` zawiera cały proces od pobrania danych po wysłanie maila.
+async function runDailyTasks() {
+  let auth;
   try {
     // Krok 1: Autoryzacja do Google API
-    const auth = await authorize();
+    auth = await authorize(); // Używamy zmiennych środowiskowych do autoryzacji
     console.log('Autoryzacja Google API pomyślna!');
 
-    // --- Konfiguracja Arkusza Google pobrana z .env ---
+    // --- Konfiguracja Arkusza Google pobrana z .env / zmiennych środowiskowych ---
     const SPREADSHEET_ID = process.env.SPREADSHEET_ID;
     const SHEET_NAME = process.env.SHEET_NAME;
     const RANGE = `${SHEET_NAME}!A:Z`; // Zakres danych do pobrania (całe kolumny od A do Z z wybranej zakładki)
     const RECIPIENT_EMAIL = process.env.RECIPIENT_EMAIL; // Adres e-mail odbiorcy podsumowania
+    const GCS_BUCKET_NAME = process.env.GCS_BUCKET_NAME; // Nazwa zasobnika GCS
 
-    if (!SPREADSHEET_ID || !SHEET_NAME) {
-      console.error('BŁĄD: Proszę uzupełnić SPREADSHEET_ID i SHEET_NAME w pliku .env przed uruchomieniem!');
-      console.error('Przykład zawartości pliku .env:');
-      console.error('SPREADSHEET_ID=twoje_id_arkusza');
-      console.error('SHEET_NAME=NazwaZakladki');
-      console.error('RECIPIENT_EMAIL=twoj.email@example.com');
-      return; // Zakończ działanie aplikacji
+    // Sprawdzanie, czy wszystkie niezbędne zmienne środowiskowe są ustawione
+    if (!SPREADSHEET_ID || !SHEET_NAME || !RECIPIENT_EMAIL || !GCS_BUCKET_NAME || !process.env.OPENAI_API_KEY || !GOOGLE_CLIENT_ID || !GOOGLE_CLIENT_SECRET || !GOOGLE_REDIRECT_URI || !GOOGLE_REFRESH_TOKEN) {
+      console.error('BŁĄD: Brakuje jednej lub więcej zmiennych środowiskowych (SPREADSHEET_ID, SHEET_NAME, RECIPIENT_EMAIL, GCS_BUCKET_NAME, OPENAI_API_KEY, GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI, GOOGLE_REFRESH_TOKEN). Upewnij się, że są ustawione w konfiguracji Cloud Run.');
+      // Rzucamy błąd, aby Cloud Run oznaczył to jako nieudane wykonanie
+      throw new Error('Brak niezbędnych zmiennych środowiskowych do uruchomienia aplikacji.');
     }
 
-    if (!RECIPIENT_EMAIL) {
-      console.error('BŁĄD: Proszę uzupełnić RECIPIENT_EMAIL w pliku .env przed uruchomieniem!');
-      console.error('Przykład zawartości pliku .env:');
-      console.error('RECIPIENT_EMAIL=twoj.email@example.com');
-      return; // Zakończ działanie aplikacji
-    }
 
     console.log(`Pobieram wszystkie dane z arkusza: ${SPREADSHEET_ID}, zakres: ${RANGE}`);
     const allRows = await getSheetData(auth, SPREADSHEET_ID, RANGE);
 
     if (allRows.length > 0) {
       console.log(`Pobrano ${allRows.length} wierszy danych z arkusza.`);
-      // console.log('Przykładowy pierwszy wiersz pobranych danych:', allRows[0]); // Odkomentuj do debugowania
 
       // Krok 2: Filtrowanie danych dla bieżącego dnia
       const dailyData = filterDailyData(allRows);
 
       if (dailyData.length > 1) { // Sprawdzamy > 1, bo dailyData zawiera nagłówki + dane
         console.log(`Znaleziono ${dailyData.length - 1} wierszy danych zadań dla dzisiaj.`);
-        // console.log('Dane dzienne (surowe):', dailyData); // Odkomentuj do debugowania
 
         // Krok 3: Mapowanie zadań do osób
         const mappedTasks = mapTasksToPeople(dailyData);
         console.log('Zadania przyporządkowane do osób (wraz z datą i dniem tygodnia):');
-        console.log(mappedTasks); // Wyświetl nową, ustrukturyzowaną formę danych
+        console.log(mappedTasks);
 
         // Krok 4: Anonimizacja danych personalnych
         console.log('\n--- Rozpoczynam anonimizację danych ---');
@@ -555,42 +588,73 @@ async function main() {
         console.log('Podsumowanie z LLM (anonimowe):');
         console.log(anonymizedSummaryFromLLM);
 
-
         // Krok 6: De-anonimizacja podsumowania z LLM
         console.log('\n--- Rozpoczynam de-anonimizację podsumowania ---');
         const finalSummary = deanonymizeSummary(anonymizedSummaryFromLLM, personalDataMap);
         console.log('Ostateczne podsumowanie (po de-anonimizacji):');
         console.log(finalSummary);
 
-        // Krok 7: Zapis podsumowania do pliku JSON
-        console.log('\n--- Zapisuję podsumowanie do pliku JSON ---');
+        // Krok 7: Zapis podsumowania do pliku JSON w Cloud Storage
+        console.log('\n--- Zapisuję podsumowanie do pliku JSON w Cloud Storage ---');
         const summaryEntry = {
             date: mappedTasks.date,
             dayOfWeek: mappedTasks.dayOfWeek,
             summary: finalSummary
         };
-        await saveSummaryToJsonFile(summaryEntry, SUMMARY_FILE_PATH);
+        // Zmieniono wywołanie funkcji na saveSummaryToGCS
+        await saveSummaryToGCS(summaryEntry); 
 
         // Krok 8: Wysyłka podsumowania na adres e-mail
         console.log('\n--- Wysyłam podsumowanie na adres e-mail ---');
         const emailSubject = `Dzienne podsumowanie zadań na ${mappedTasks.dayOfWeek}, ${mappedTasks.date}`;
         await sendEmail(auth, RECIPIENT_EMAIL, emailSubject, finalSummary);
 
+        console.log('\n--- Wszystkie zadania wykonane pomyślnie! ---');
+        return "Zadania wykonane pomyślnie!"; // Zwróć sukces dla Cloud Run
+
       } else {
-        console.log('Brak danych zadań dla bieżącego dnia w arkuszu.');
+        console.log('Brak danych zadań dla bieżącego dnia w arkuszu. Zakończono bez generowania podsumowania.');
+        return "Brak danych zadań dla bieżącego dnia.";
       }
     } else {
-      console.log('Arkusz jest pusty lub nie zawiera danych do przetworzenia.');
+      console.log('Arkusz jest pusty lub nie zawiera danych do przetworzenia. Zakończono bez generowania podsumowania.');
+      return "Arkusz jest pusty.";
     }
 
   } catch (err) {
     console.error('Wystąpił krytyczny błąd w aplikacji:', err.message);
-    console.error('Szczegóły błędu:', err); // Pełny obiekt błędu do szczegółowego debugowania
-    console.error('Upewnij się, że masz poprawny plik credentials.json i token.json (spróbuj go usunąć i ponownie uruchomić, jeśli problem się powtarza).');
-    console.error('Sprawdź też, czy ID Arkusza, nazwa zakładki i adres e-mail odbiorcy są poprawnie ustawione w .env oraz czy masz dostęp do internetu.');
-    console.error('Jeśli używasz LLM, upewnij się, że klucz OPENAI_API_KEY jest poprawny i masz dostęp do API.');
+    console.error('Szczegóły błędu:', err);
+    console.error('Upewnij się, że wszystkie zmienne środowiskowe są poprawnie ustawione w Cloud Run (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI, GOOGLE_REFRESH_TOKEN, SPREADSHEET_ID, SHEET_NAME, RECIPIENT_EMAIL, GCS_BUCKET_NAME, OPENAI_API_KEY) oraz że konta serwisowe mają odpowiednie uprawnienia.');
+    throw err; // Ważne, aby rzucić błąd, by Cloud Run zarejestrował nieudane wykonanie
   }
 }
 
-// Uruchomienie głównej funkcji aplikacji
-main();
+// --- Serwer HTTP dla Cloud Run ---
+// Cloud Run oczekuje serwera HTTP, który będzie nasłuchiwał na określonym porcie.
+// Cloud Scheduler będzie wysyłał żądania do tego endpointu, aby uruchomić aplikację.
+
+const PORT = process.env.PORT || 8080; // Cloud Run dostarcza port przez zmienną środowiskową PORT
+
+app.get('/', (req, res) => {
+  // Prosta odpowiedź na żądanie GET, używana głównie do sprawdzenia, czy serwis działa
+  res.status(200).send('Aplikacja Podsumowująca API jest aktywna. Użyj endpointu /run, aby uruchomić zadania.');
+});
+
+// Endpoint, który będzie wywoływany przez Cloud Scheduler (metoda POST)
+app.post('/run', async (req, res) => {
+  console.log('Otrzymano żądanie uruchomienia zadań z Cloud Scheduler.');
+  try {
+    const result = await runDailyTasks();
+    res.status(200).send({ status: 'success', message: result });
+  } catch (error) {
+    console.error('Błąd podczas wykonywania zadań:', error);
+    res.status(500).send({ status: 'error', message: error.message });
+  }
+});
+
+// Uruchomienie serwera HTTP
+app.listen(PORT, () => {
+  console.log(`Aplikacja nasłuchuje na porcie ${PORT}`);
+  console.log('--- UWAGA: To jest środowisko Cloud Run. Interaktywna autoryzacja OAuth nie jest wspierana. ---');
+  console.log('--- Upewnij się, że GOOGLE_REFRESH_TOKEN jest ustawiony jako zmienna środowiskowa. ---');
+});
