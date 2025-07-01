@@ -1,0 +1,5 @@
+.env
+credentials.json
+token.json
+daily_summaries.json
+node_modules/ # Jeśli instalujesz zależności w Dockerfile, nie musisz kopiować lokalnych node_modules
