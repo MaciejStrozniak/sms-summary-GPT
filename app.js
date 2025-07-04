@@ -303,19 +303,21 @@ async function generateSummaryWithLLM(anonymizedData) {
   const apiUrl = 'https://api.openai.com/v1/chat/completions'; 
 
   const prompt = `
-  Stwórz bardzo krótkie (maks. 160 znaków), zwięzłe podsumowanie dziennych zadań. Podsumowanie ma być w języku polskim i nadawać się do wysłania SMS-em. 
-  Skup się na przypisaniu zadań konkretnym osobom.
-  Podaj dzień tygodnia, w którym mają być realizowana zadania.
+  Stwórz bardzo krótkie (maks. 160 znaków), zwięzłe podsumowanie dziennych aktywności. Podsumowanie ma być w języku polskim, napisane naturalnym, konwersacyjnym tonem, tak jakbyś opowiadał o tym znajomemu. Skup się na najważniejszych zadaniach wykonanych przez poszczególne osoby w danym dniu.
 
-  WAŻNE
-  Nie zmieniaj składni nazw pracownik_1, pracownik_2. W Twojej odpowiedzi zawsze trzymaj podanej formy.
+  Podsumowanie powinno zawierać:
 
-  Oto dane:
+  Dzień tygodnia i datę.
+
+  Krótki opis, co robiła każda osoba.
+
+  Oto dane do podsumowania:
   Dzień tygodnia: ${anonymizedData.dayOfWeek}
   Data: ${anonymizedData.date}
   Zadania: ${JSON.stringify(anonymizedData.tasksByPerson, null, 2)}
 
-  Podsumowanie:`;
+  Podsumowanie:
+  `;
 
   const payload = {
     model: "gpt-3.5-turbo", 
