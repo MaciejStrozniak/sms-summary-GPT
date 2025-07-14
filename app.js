@@ -303,18 +303,27 @@ async function generateSummaryWithLLM(anonymizedData) {
   const apiUrl = 'https://api.openai.com/v1/chat/completions'; 
 
   const prompt = `
-  Stwórz bardzo krótkie (maks. 160 znaków), zwięzłe podsumowanie dziennych aktywności. Podsumowanie ma być w języku polskim, napisane naturalnym, konwersacyjnym tonem, tak jakbyś opowiadał o tym znajomemu. Skup się na najważniejszych zadaniach wykonanych przez poszczególne osoby w danym dniu.
+  Stwórz bardzo krótkie (maks. 160 znaków), zwięzłe podsumowanie dziennych aktywności.
+  Podsumowanie ma być w języku polskim, napisane naturalnym, konwersacyjnym tonem, tak jakbyś opowiadał o tym znajomemu.
+  Skup się na najważniejszych zadaniach wykonanych przez poszczególne osoby w danym dniu.
 
   Podsumowanie powinno zawierać:
 
   Dzień tygodnia i datę.
-
   Krótki opis, co robiła każda osoba.
+  Podsumowanie musi być napisane w czasie teraźniejszym.
+  Podsumowanie musi być napisane w języku polskim.
 
   Oto dane do podsumowania:
   Dzień tygodnia: ${anonymizedData.dayOfWeek}
   Data: ${anonymizedData.date}
   Zadania: ${JSON.stringify(anonymizedData.tasksByPerson, null, 2)}
+
+  Format podsumowania (przykłady z różną liczbą pracowników):
+  Data. Dzień tygodnia. Dzisiaj pracownik 1 robi "tutaj informacja przekazana w Zadania". Pracownik 3 zajmuje się "tutaj informacja przekazana w Zadania". itd.
+  Data. Dzień tygodnia. Dzisiaj pracownik 3 robi "tutaj informacja przekazana w Zadania". Pracownik 2 zajmuje się "tutaj informacja przekazana w Zadania". itd.
+  Data. Dzień tygodnia. Dzisiaj pracownik 2 robi "tutaj informacja przekazana w Zadania". Pracownik 1 zajmuje się "tutaj informacja przekazana w Zadania". Pracownik 3 zajmuje się "tutaj informacja przekazana w Zadania". itd.
+  Data. Dzień tygodnia. Dzisiaj pracownik 3 robi "tutaj informacja przekazana w Zadania". Pracownik 2 zajmuje się "tutaj informacja przekazana w Zadania". Pracownik 1 zajmuje się "tutaj informacja przekazana w Zadania". itd.
 
   Podsumowanie:
   `;
