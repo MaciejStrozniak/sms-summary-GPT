@@ -302,15 +302,19 @@ async function generateSummaryWithLLM(anonymizedData) {
 
   const apiUrl = 'https://api.openai.com/v1/chat/completions'; 
 
+  // Stwórz bardzo krótkie (maks. 160 znaków), zwięzłe podsumowanie dziennych aktywności.
+
   const prompt = `
-  Stwórz bardzo krótkie (maks. 160 znaków), zwięzłe podsumowanie dziennych aktywności.
+  Stwórz bardzo krótkie, zwięzłe podsumowanie dziennych aktywności.
   Podsumowanie ma być w języku polskim, napisane naturalnym, konwersacyjnym tonem, tak jakbyś opowiadał o tym znajomemu.
   Skup się na najważniejszych zadaniach wykonanych przez poszczególne osoby w danym dniu.
-
+  Nie możesz pominąć żadnego zadania.
+  Nie możesz pominąć żadnego pracownika.
+  
   Podsumowanie powinno zawierać:
-
-  Dzień tygodnia i datę.
-  Krótki opis, co robiła każda osoba.
+  Zadania wszystkich pracowników.
+  Godziny realizacji zadań- jeśli te zostały podane przez pracownika.
+  Krótki opis, co robiła każda osoba. Możesz użyć zwrotu "zajmuje się" lub "robimy".
   Podsumowanie musi być napisane w czasie teraźniejszym.
   Podsumowanie musi być napisane w języku polskim.
 
@@ -319,11 +323,19 @@ async function generateSummaryWithLLM(anonymizedData) {
   Data: ${anonymizedData.date}
   Zadania: ${JSON.stringify(anonymizedData.tasksByPerson, null, 2)}
 
+  Przykłady zapisu godzin realizacji zadań. Możesz spotkać się z różnymi formatami:
+  12 - 14:50
+  10 - 12
+  9 - 16
+  9 do 12
+  12:00 do 13:10
+  10:30 do 16:20
+
   Format podsumowania (przykłady z różną liczbą pracowników):
-  Data. Dzień tygodnia. Dzisiaj pracownik 1 robi "tutaj informacja przekazana w Zadania". Pracownik 3 zajmuje się "tutaj informacja przekazana w Zadania". itd.
-  Data. Dzień tygodnia. Dzisiaj pracownik 3 robi "tutaj informacja przekazana w Zadania". Pracownik 2 zajmuje się "tutaj informacja przekazana w Zadania". itd.
-  Data. Dzień tygodnia. Dzisiaj pracownik 2 robi "tutaj informacja przekazana w Zadania". Pracownik 1 zajmuje się "tutaj informacja przekazana w Zadania". Pracownik 3 zajmuje się "tutaj informacja przekazana w Zadania". itd.
-  Data. Dzień tygodnia. Dzisiaj pracownik 3 robi "tutaj informacja przekazana w Zadania". Pracownik 2 zajmuje się "tutaj informacja przekazana w Zadania". Pracownik 1 zajmuje się "tutaj informacja przekazana w Zadania". itd.
+  Dzisiaj od 9 do 12 pracownik 1 robi "tutaj informacja przekazana w Zadania". Pracownik 3 od 9:30 do 12 zajmuje się "tutaj informacja przekazana w Zadania". itd.
+  Dzisiaj od 10 do 12:15 pracownik 3 robi "tutaj informacja przekazana w Zadania". Pracownik 2 od 9 do 16:15 zajmuje się "tutaj informacja przekazana w Zadania". itd.
+  Dzisiaj od 13 do 15:30 pracownik 2 robi "tutaj informacja przekazana w Zadania". Pracownik 1 od 11:20 do 12 zajmuje się "tutaj informacja przekazana w Zadania". Pracownik 3 od 8 do 12:30 zajmuje się "tutaj informacja przekazana w Zadania". itd.
+  Dzisiaj od 12 do 13:10 pracownik 3 robi "tutaj informacja przekazana w Zadania". Pracownik 2 od 10 do 15 zajmuje się "tutaj informacja przekazana w Zadania". Pracownik 1 od 11 do 15 zajmuje się "tutaj informacja przekazana w Zadania". itd.
 
   Podsumowanie:
   `;
@@ -335,7 +347,7 @@ async function generateSummaryWithLLM(anonymizedData) {
       { role: "user", content: prompt }
     ],
     temperature: 0.7, 
-    max_tokens: 100,  
+    max_tokens: 250,  
     top_p: 1,
     frequency_penalty: 0,
     presence_penalty: 0,
