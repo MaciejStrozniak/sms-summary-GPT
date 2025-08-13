@@ -1,4 +1,6 @@
 .env
+.git
+.npm-debug.log
 credentials.json
 token.json
 daily_summaries.json
